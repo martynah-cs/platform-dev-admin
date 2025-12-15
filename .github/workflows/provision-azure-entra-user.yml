@@ -390,6 +390,45 @@ jobs:
             exit 1
           fi
 
+      - name: Output Invitation URL
+        if: steps.create_user.outputs.invitation_url != ''
+        run: |
+          echo "=========================================="
+          echo "INVITATION URL FOR USER"
+          echo "=========================================="
+          echo "${{ steps.create_user.outputs.invitation_url }}"
+          echo "=========================================="
+          echo ""
+          echo "Send this URL to the user: ${{ inputs.user_email }}"
+
+      - name: Send Slack Notification with Invitation URL
+        if: steps.create_user.outputs.invitation_url != ''
+        continue-on-error: true
+        run: |
+          INVITE_URL="${{ steps.create_user.outputs.invitation_url }}"
+          USER_EMAIL="${{ inputs.user_email }}"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "User Invitation URL Ready",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*User Invitation URL*\n\nUser: $USER_EMAIL\n\nInvitation URL:\n$INVITE_URL"
+                }
+              }
+            ]
+          }
+          EOF
+          )
+
+          curl -s -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
       - name: Generate Summary
         if: always()
         run: |
