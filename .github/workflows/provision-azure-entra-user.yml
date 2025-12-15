@@ -144,7 +144,6 @@ jobs:
 
       - name: Check if User Exists
         id: check_user
-        continue-on-error: true
         run: |
           EMAIL="${{ steps.validate.outputs.normalized_email }}"
           ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
@@ -322,7 +321,6 @@ jobs:
 
       - name: Check Group Membership
         id: check_membership
-        continue-on-error: true
         run: |
           GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
           USER_ID="${{ steps.user.outputs.user_id }}"
