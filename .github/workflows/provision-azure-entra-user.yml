@@ -326,6 +326,37 @@ jobs:
           USER_ID="${{ steps.user.outputs.user_id }}"
           ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
+          # Wait for user to be fully created (eventual consistency)
+          echo "Waiting for user to be fully provisioned..."
+          MAX_ATTEMPTS=10
+          ATTEMPT=1
+          USER_READY=false
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS: Checking if user is available..."
+
+            USER_CHECK=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://graph.microsoft.com/v1.0/users/$USER_ID")
+
+            USER_CHECK_CODE=$(echo "$USER_CHECK" | tail -n1)
+
+            if [ "$USER_CHECK_CODE" = "200" ]; then
+              echo "User is available in directory"
+              USER_READY=true
+              break
+            else
+              echo "User not yet available (HTTP $USER_CHECK_CODE), waiting 5 seconds..."
+              sleep 5
+              ATTEMPT=$((ATTEMPT + 1))
+            fi
+          done
+
+          if [ "$USER_READY" = "false" ]; then
+            echo "Warning: User may not be fully provisioned yet"
+          fi
+
           # Check if user is already a member using Microsoft Graph API
           MEMBER_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
