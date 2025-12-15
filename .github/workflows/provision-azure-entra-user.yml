@@ -239,12 +239,15 @@ jobs:
           GROUP_INPUT="${{ inputs.entra_group_name }}"
           ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
+          echo "Looking for group: $GROUP_INPUT"
+
           # Check if input is already a GUID (Object ID)
           if echo "$GROUP_INPUT" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
             GROUP_ID="$GROUP_INPUT"
             echo "Using provided Group Object ID: $GROUP_ID"
           else
             # Search for group by display name using Microsoft Graph API
+            echo "Searching for group by display name..."
             GROUP_RESPONSE=$(curl -s -w "\n%{http_code}" \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json" \
@@ -253,10 +256,27 @@ jobs:
             HTTP_CODE=$(echo "$GROUP_RESPONSE" | tail -n1)
             GROUP_JSON=$(echo "$GROUP_RESPONSE" | head -n-1)
 
-            if [ "$HTTP_CODE" = "200" ]; then
-              GROUP_COUNT=$(echo "$GROUP_JSON" | jq -r '.value | length')
+            echo "HTTP Status: $HTTP_CODE"
 
-              if [ "$GROUP_COUNT" -eq 0 ]; then
+            if [ "$HTTP_CODE" = "200" ]; then
+              # Check if response has value array
+              if ! echo "$GROUP_JSON" | jq -e '.value' > /dev/null 2>&1; then
+                echo "Error: Invalid response from Microsoft Graph API"
+                echo "$GROUP_JSON"
+                exit 1
+              fi
+
+              GROUP_COUNT=$(echo "$GROUP_JSON" | jq -r '.value | length')
+              echo "Found $GROUP_COUNT group(s) matching the name"
+
+              # Validate GROUP_COUNT is a number
+              if ! [[ "$GROUP_COUNT" =~ ^[0-9]+$ ]]; then
+                echo "Error: Could not determine group count"
+                echo "$GROUP_JSON"
+                exit 1
+              fi
+
+              if [ "$GROUP_COUNT" = "0" ]; then
                 echo "Error: Group not found: $GROUP_INPUT"
                 exit 1
               elif [ "$GROUP_COUNT" -gt 1 ]; then
@@ -265,11 +285,16 @@ jobs:
                 exit 1
               else
                 GROUP_ID=$(echo "$GROUP_JSON" | jq -r '.value[0].id')
+                if [ "$GROUP_ID" = "null" ] || [ -z "$GROUP_ID" ]; then
+                  echo "Error: Could not extract group ID"
+                  echo "$GROUP_JSON"
+                  exit 1
+                fi
                 echo "Found group by name: $GROUP_INPUT (ID: $GROUP_ID)"
               fi
             else
               echo "Error: Failed to search for group (HTTP $HTTP_CODE)"
-              echo "$GROUP_JSON"
+              echo "Response: $GROUP_JSON"
               exit 1
             fi
           fi
