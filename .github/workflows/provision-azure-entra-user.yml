@@ -103,15 +103,28 @@ jobs:
             fi
           done
 
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          creds: |
-            {
-              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
-            }
+      - name: Authenticate to Microsoft Graph
+        id: auth
+        run: |
+          # Get access token for Microsoft Graph API
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Error: Failed to authenticate"
+            echo "$TOKEN_RESPONSE" | jq '.'
+            exit 1
+          fi
+
+          echo "Successfully authenticated to Microsoft Graph API"
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
 
       - name: Validate Input Email
         id: validate
@@ -134,11 +147,18 @@ jobs:
         continue-on-error: true
         run: |
           EMAIL="${{ steps.validate.outputs.normalized_email }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
-          # Try to get user
-          USER_JSON=$(az ad user show --id "$EMAIL" 2>&1 || true)
+          # Try to get user using Microsoft Graph API
+          USER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://graph.microsoft.com/v1.0/users/$EMAIL")
 
-          if echo "$USER_JSON" | grep -q '"id"'; then
+          HTTP_CODE=$(echo "$USER_RESPONSE" | tail -n1)
+          USER_JSON=$(echo "$USER_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "200" ]; then
             USER_ID=$(echo "$USER_JSON" | jq -r '.id')
             USER_DISPLAY_NAME=$(echo "$USER_JSON" | jq -r '.displayName')
             echo "user_exists=true" >> $GITHUB_OUTPUT
@@ -158,14 +178,12 @@ jobs:
           DISPLAY_NAME="${{ inputs.display_name }}"
           SEND_INVITE="${{ inputs.send_invitation }}"
           REDIRECT_URL="${{ inputs.invitation_redirect_url }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
           # Derive display name from email if not provided
           if [ -z "$DISPLAY_NAME" ]; then
             DISPLAY_NAME=$(echo "$EMAIL" | cut -d'@' -f1 | sed 's/[._-]/ /g')
           fi
-
-          # Get access token
-          ACCESS_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
 
           # Create invitation payload
           INVITE_PAYLOAD=$(cat <<EOF
@@ -219,20 +237,39 @@ jobs:
         id: resolve_group
         run: |
           GROUP_INPUT="${{ inputs.entra_group_name }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
           # Check if input is already a GUID (Object ID)
           if echo "$GROUP_INPUT" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
             GROUP_ID="$GROUP_INPUT"
             echo "Using provided Group Object ID: $GROUP_ID"
           else
-            # Search for group by display name
-            GROUP_JSON=$(az ad group show --group "$GROUP_INPUT" 2>&1 || true)
+            # Search for group by display name using Microsoft Graph API
+            GROUP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://graph.microsoft.com/v1.0/groups?\$filter=displayName eq '$GROUP_INPUT'")
 
-            if echo "$GROUP_JSON" | grep -q '"id"'; then
-              GROUP_ID=$(echo "$GROUP_JSON" | jq -r '.id')
-              echo "Found group by name: $GROUP_INPUT (ID: $GROUP_ID)"
+            HTTP_CODE=$(echo "$GROUP_RESPONSE" | tail -n1)
+            GROUP_JSON=$(echo "$GROUP_RESPONSE" | head -n-1)
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              GROUP_COUNT=$(echo "$GROUP_JSON" | jq -r '.value | length')
+
+              if [ "$GROUP_COUNT" -eq 0 ]; then
+                echo "Error: Group not found: $GROUP_INPUT"
+                exit 1
+              elif [ "$GROUP_COUNT" -gt 1 ]; then
+                echo "Error: Multiple groups found with name: $GROUP_INPUT"
+                echo "Please use the Group Object ID instead"
+                exit 1
+              else
+                GROUP_ID=$(echo "$GROUP_JSON" | jq -r '.value[0].id')
+                echo "Found group by name: $GROUP_INPUT (ID: $GROUP_ID)"
+              fi
             else
-              echo "Error: Group not found: $GROUP_INPUT"
+              echo "Error: Failed to search for group (HTTP $HTTP_CODE)"
+              echo "$GROUP_JSON"
               exit 1
             fi
           fi
@@ -245,19 +282,30 @@ jobs:
         run: |
           GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
           USER_ID="${{ steps.user.outputs.user_id }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
-          # Check if user is already a member
-          CHECK_RESULT=$(az ad group member check \
-            --group "$GROUP_ID" \
-            --member-id "$USER_ID" \
-            --query 'value' -o tsv 2>&1 || echo "false")
+          # Check if user is already a member using Microsoft Graph API
+          MEMBER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members?\$filter=id eq '$USER_ID'")
 
-          if [ "$CHECK_RESULT" = "true" ]; then
-            echo "is_member=true" >> $GITHUB_OUTPUT
-            echo "User is already a member of the group"
+          HTTP_CODE=$(echo "$MEMBER_RESPONSE" | tail -n1)
+          MEMBER_JSON=$(echo "$MEMBER_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            MEMBER_COUNT=$(echo "$MEMBER_JSON" | jq -r '.value | length')
+
+            if [ "$MEMBER_COUNT" -gt 0 ]; then
+              echo "is_member=true" >> $GITHUB_OUTPUT
+              echo "User is already a member of the group"
+            else
+              echo "is_member=false" >> $GITHUB_OUTPUT
+              echo "User is not a member of the group"
+            fi
           else
             echo "is_member=false" >> $GITHUB_OUTPUT
-            echo "User is not a member of the group"
+            echo "Could not determine membership, will attempt to add"
           fi
 
       - name: Add User to Group
@@ -266,9 +314,7 @@ jobs:
         run: |
           GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
           USER_ID="${{ steps.user.outputs.user_id }}"
-
-          # Get access token
-          ACCESS_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
           # Add user to group
           PAYLOAD=$(cat <<EOF
