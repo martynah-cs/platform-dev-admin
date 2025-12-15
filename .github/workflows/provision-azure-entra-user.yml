@@ -90,7 +90,7 @@ jobs:
               -X POST \
               -H 'Content-Type: application/json' \
               -d "$PAYLOAD" \
-              "${{ secrets.SLACK_WEBHOOK_URL }}")
+              "${{ secrets.SLACK_NOTIFY_WEBHOOK_URL }}")
 
             if [ "$RESPONSE" = "200" ]; then
               echo "Slack notification sent successfully"
