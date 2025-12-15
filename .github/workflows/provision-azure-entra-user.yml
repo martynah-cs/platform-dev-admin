@@ -236,6 +236,7 @@ jobs:
       - name: Resolve Group ID
         id: resolve_group
         run: |
+          set -x  # Enable debug mode
           GROUP_INPUT="${{ inputs.entra_group_name }}"
           ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
@@ -248,15 +249,34 @@ jobs:
           else
             # Search for group by display name using Microsoft Graph API
             echo "Searching for group by display name..."
+
+            # Construct URL with proper encoding
+            FILTER_URL="https://graph.microsoft.com/v1.0/groups?\$filter=displayName eq '$GROUP_INPUT'"
+            echo "Request URL: $FILTER_URL"
+
             GROUP_RESPONSE=$(curl -s -w "\n%{http_code}" \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json" \
-              "https://graph.microsoft.com/v1.0/groups?\$filter=displayName eq '$GROUP_INPUT'")
+              "$FILTER_URL" 2>&1)
 
-            HTTP_CODE=$(echo "$GROUP_RESPONSE" | tail -n1)
-            GROUP_JSON=$(echo "$GROUP_RESPONSE" | head -n-1)
+            CURL_EXIT_CODE=$?
+            if [ $CURL_EXIT_CODE -ne 0 ]; then
+              echo "Error: curl command failed with exit code $CURL_EXIT_CODE"
+              echo "$GROUP_RESPONSE"
+              exit 1
+            fi
+
+            # Check if we got a response
+            if [ -z "$GROUP_RESPONSE" ]; then
+              echo "Error: Empty response from Microsoft Graph API"
+              exit 1
+            fi
+
+            HTTP_CODE=$(echo "$GROUP_RESPONSE" | tail -n1 || echo "000")
+            GROUP_JSON=$(echo "$GROUP_RESPONSE" | head -n-1 || echo "{}")
 
             echo "HTTP Status: $HTTP_CODE"
+            echo "Response preview: $(echo "$GROUP_JSON" | head -c 200)"
 
             if [ "$HTTP_CODE" = "200" ]; then
               # Check if response has value array
