@@ -1,0 +1,350 @@
+name: Provision Azure Entra User
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_email:
+        description: 'Email address of user to provision'
+        required: true
+        type: string
+      entra_group_name:
+        description: 'Azure Entra group name or Object ID'
+        required: false
+        type: string
+        default: 'CS-AZURE-USERS'
+      display_name:
+        description: 'Display name for new users (optional)'
+        required: false
+        type: string
+      send_invitation:
+        description: 'Send invitation email'
+        required: false
+        type: boolean
+        default: true
+      invitation_redirect_url:
+        description: 'Redirect URL after invitation acceptance'
+        required: false
+        type: string
+        default: 'https://myapps.microsoft.com'
+
+jobs:
+  provision-user:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Slack Notification
+        continue-on-error: true
+        run: |
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "Azure Entra User Provisioning Initiated",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "Azure Entra User Provisioning Started"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Initiated By:*\n${{ github.actor }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*User Email:*\n${{ inputs.user_email }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Target Group:*\n${{ inputs.entra_group_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Status:*\nIn Progress"
+                  }
+                ]
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "<${WORKFLOW_URL}|View Workflow Run> | Triggered at ${TIMESTAMP}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Retry logic for Slack notification
+          for i in 1 2; do
+            RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/slack_response.txt \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "$PAYLOAD" \
+              "${{ secrets.SLACK_WEBHOOK_URL }}")
+
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Slack notification sent successfully"
+              break
+            else
+              echo "Slack notification attempt $i failed with status $RESPONSE"
+              if [ $i -eq 1 ]; then
+                sleep 5
+              fi
+            fi
+          done
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Validate Input Email
+        id: validate
+        run: |
+          EMAIL="${{ inputs.user_email }}"
+
+          # Validate email format
+          if ! echo "$EMAIL" | grep -qE '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+            echo "Error: Invalid email format: $EMAIL"
+            exit 1
+          fi
+
+          # Normalize email
+          NORMALIZED_EMAIL=$(echo "$EMAIL" | tr '[:upper:]' '[:lower:]' | xargs)
+          echo "normalized_email=$NORMALIZED_EMAIL" >> $GITHUB_OUTPUT
+          echo "Email validated: $NORMALIZED_EMAIL"
+
+      - name: Check if User Exists
+        id: check_user
+        continue-on-error: true
+        run: |
+          EMAIL="${{ steps.validate.outputs.normalized_email }}"
+
+          # Try to get user
+          USER_JSON=$(az ad user show --id "$EMAIL" 2>&1 || true)
+
+          if echo "$USER_JSON" | grep -q '"id"'; then
+            USER_ID=$(echo "$USER_JSON" | jq -r '.id')
+            USER_DISPLAY_NAME=$(echo "$USER_JSON" | jq -r '.displayName')
+            echo "user_exists=true" >> $GITHUB_OUTPUT
+            echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+            echo "user_display_name=$USER_DISPLAY_NAME" >> $GITHUB_OUTPUT
+            echo "User already exists: $USER_DISPLAY_NAME (ID: $USER_ID)"
+          else
+            echo "user_exists=false" >> $GITHUB_OUTPUT
+            echo "User does not exist, will create new guest user"
+          fi
+
+      - name: Create User and Send Invitation
+        id: create_user
+        if: steps.check_user.outputs.user_exists != 'true'
+        run: |
+          EMAIL="${{ steps.validate.outputs.normalized_email }}"
+          DISPLAY_NAME="${{ inputs.display_name }}"
+          SEND_INVITE="${{ inputs.send_invitation }}"
+          REDIRECT_URL="${{ inputs.invitation_redirect_url }}"
+
+          # Derive display name from email if not provided
+          if [ -z "$DISPLAY_NAME" ]; then
+            DISPLAY_NAME=$(echo "$EMAIL" | cut -d'@' -f1 | sed 's/[._-]/ /g')
+          fi
+
+          # Get access token
+          ACCESS_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+
+          # Create invitation payload
+          INVITE_PAYLOAD=$(cat <<EOF
+          {
+            "invitedUserEmailAddress": "$EMAIL",
+            "invitedUserDisplayName": "$DISPLAY_NAME",
+            "sendInvitationMessage": $SEND_INVITE,
+            "inviteRedirectUrl": "$REDIRECT_URL"
+          }
+          EOF
+          )
+
+          # Send invitation
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$INVITE_PAYLOAD" \
+            "https://graph.microsoft.com/v1.0/invitations")
+
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "Error creating user:"
+            echo "$RESPONSE" | jq '.error'
+            exit 1
+          fi
+
+          # Extract user details
+          USER_ID=$(echo "$RESPONSE" | jq -r '.invitedUser.id')
+          INVITE_URL=$(echo "$RESPONSE" | jq -r '.inviteRedeemUrl')
+
+          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+          echo "invitation_url=$INVITE_URL" >> $GITHUB_OUTPUT
+          echo "user_display_name=$DISPLAY_NAME" >> $GITHUB_OUTPUT
+          echo "User created successfully: $DISPLAY_NAME (ID: $USER_ID)"
+          echo "Invitation URL: $INVITE_URL"
+
+      - name: Set User ID
+        id: user
+        run: |
+          if [ "${{ steps.check_user.outputs.user_exists }}" = "true" ]; then
+            echo "user_id=${{ steps.check_user.outputs.user_id }}" >> $GITHUB_OUTPUT
+            echo "display_name=${{ steps.check_user.outputs.user_display_name }}" >> $GITHUB_OUTPUT
+            echo "was_created=false" >> $GITHUB_OUTPUT
+          else
+            echo "user_id=${{ steps.create_user.outputs.user_id }}" >> $GITHUB_OUTPUT
+            echo "display_name=${{ steps.create_user.outputs.user_display_name }}" >> $GITHUB_OUTPUT
+            echo "was_created=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Resolve Group ID
+        id: resolve_group
+        run: |
+          GROUP_INPUT="${{ inputs.entra_group_name }}"
+
+          # Check if input is already a GUID (Object ID)
+          if echo "$GROUP_INPUT" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+            GROUP_ID="$GROUP_INPUT"
+            echo "Using provided Group Object ID: $GROUP_ID"
+          else
+            # Search for group by display name
+            GROUP_JSON=$(az ad group show --group "$GROUP_INPUT" 2>&1 || true)
+
+            if echo "$GROUP_JSON" | grep -q '"id"'; then
+              GROUP_ID=$(echo "$GROUP_JSON" | jq -r '.id')
+              echo "Found group by name: $GROUP_INPUT (ID: $GROUP_ID)"
+            else
+              echo "Error: Group not found: $GROUP_INPUT"
+              exit 1
+            fi
+          fi
+
+          echo "group_id=$GROUP_ID" >> $GITHUB_OUTPUT
+
+      - name: Check Group Membership
+        id: check_membership
+        continue-on-error: true
+        run: |
+          GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
+          USER_ID="${{ steps.user.outputs.user_id }}"
+
+          # Check if user is already a member
+          CHECK_RESULT=$(az ad group member check \
+            --group "$GROUP_ID" \
+            --member-id "$USER_ID" \
+            --query 'value' -o tsv 2>&1 || echo "false")
+
+          if [ "$CHECK_RESULT" = "true" ]; then
+            echo "is_member=true" >> $GITHUB_OUTPUT
+            echo "User is already a member of the group"
+          else
+            echo "is_member=false" >> $GITHUB_OUTPUT
+            echo "User is not a member of the group"
+          fi
+
+      - name: Add User to Group
+        id: add_to_group
+        if: steps.check_membership.outputs.is_member != 'true'
+        run: |
+          GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
+          USER_ID="${{ steps.user.outputs.user_id }}"
+
+          # Get access token
+          ACCESS_TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+
+          # Add user to group
+          PAYLOAD=$(cat <<EOF
+          {
+            "@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/$USER_ID"
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members/\$ref")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          # 204 = success, 400 with "already exists" = acceptable
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "User added to group successfully"
+            echo "added=true" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_CODE" = "400" ] && echo "$BODY" | grep -q "already exists"; then
+            echo "User is already a member of the group"
+            echo "added=false" >> $GITHUB_OUTPUT
+          else
+            echo "Error adding user to group (HTTP $HTTP_CODE):"
+            echo "$BODY"
+            exit 1
+          fi
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# User Provisioning Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # User details
+          echo "## User Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Email**: ${{ steps.validate.outputs.normalized_email }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Display Name**: ${{ steps.user.outputs.display_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **User Object ID**: ${{ steps.user.outputs.user_id }}" >> $GITHUB_STEP_SUMMARY
+
+          # User status
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## User Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.user.outputs.was_created }}" = "true" ]; then
+            echo "- **Action**: Newly created guest user" >> $GITHUB_STEP_SUMMARY
+            echo "- **Invitation Sent**: ${{ inputs.send_invitation }}" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ steps.create_user.outputs.invitation_url }}" ]; then
+              echo "- **Invitation URL**: ${{ steps.create_user.outputs.invitation_url }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- **Action**: User already existed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Group membership
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Group Membership" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Group**: ${{ inputs.entra_group_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Group Object ID**: ${{ steps.resolve_group.outputs.group_id }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_membership.outputs.is_member }}" = "true" ]; then
+            echo "- **Status**: User was already a member" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.add_to_group.outputs.added }}" = "true" ]; then
+            echo "- **Status**: User added to group successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: Failed to determine or update membership" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Workflow details
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Workflow Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered By**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +"%Y-%m-%d %H:%M UTC")" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "Provisioning completed successfully" >> $GITHUB_STEP_SUMMARY
