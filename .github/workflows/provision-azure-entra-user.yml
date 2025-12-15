@@ -408,21 +408,22 @@ jobs:
           INVITE_URL="${{ steps.create_user.outputs.invitation_url }}"
           USER_EMAIL="${{ inputs.user_email }}"
 
-          PAYLOAD=$(cat <<EOF
-          {
-            "text": "User Invitation URL Ready",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*User Invitation URL*\n\nUser: $USER_EMAIL\n\nInvitation URL:\n$INVITE_URL"
+          # Use jq to properly escape the URL in JSON
+          PAYLOAD=$(jq -n \
+            --arg url "$INVITE_URL" \
+            --arg email "$USER_EMAIL" \
+            '{
+              "text": "User Invitation URL Ready",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*User Invitation URL*\n\nUser: " + $email + "\n\nInvitation URL:\n" + $url)
+                  }
                 }
-              }
-            ]
-          }
-          EOF
-          )
+              ]
+            }')
 
           curl -s -X POST \
             -H 'Content-Type: application/json' \
