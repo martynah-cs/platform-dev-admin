@@ -357,28 +357,25 @@ jobs:
             echo "Warning: User may not be fully provisioned yet"
           fi
 
-          # Check if user is already a member using Microsoft Graph API
-          MEMBER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          # Check if user is already a member using direct member lookup
+          echo "Checking if user is a member of the group..."
+          MEMBER_CHECK=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members?\$filter=id eq '$USER_ID'")
+            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members/$USER_ID/\$ref" 2>&1)
 
-          HTTP_CODE=$(echo "$MEMBER_RESPONSE" | tail -n1)
-          MEMBER_JSON=$(echo "$MEMBER_RESPONSE" | head -n-1)
+          MEMBER_HTTP_CODE=$(echo "$MEMBER_CHECK" | tail -n1 || echo "000")
 
-          if [ "$HTTP_CODE" = "200" ]; then
-            MEMBER_COUNT=$(echo "$MEMBER_JSON" | jq -r '.value | length')
+          echo "Membership check HTTP status: $MEMBER_HTTP_CODE"
 
-            if [ "$MEMBER_COUNT" -gt 0 ]; then
-              echo "is_member=true" >> $GITHUB_OUTPUT
-              echo "User is already a member of the group"
-            else
-              echo "is_member=false" >> $GITHUB_OUTPUT
-              echo "User is not a member of the group"
-            fi
+          if [ "$MEMBER_HTTP_CODE" = "200" ]; then
+            echo "is_member=true" >> $GITHUB_OUTPUT
+            echo "User is already a member of the group"
+          elif [ "$MEMBER_HTTP_CODE" = "404" ]; then
+            echo "is_member=false" >> $GITHUB_OUTPUT
+            echo "User is not a member of the group"
           else
             echo "is_member=false" >> $GITHUB_OUTPUT
-            echo "Could not determine membership, will attempt to add"
+            echo "Could not determine membership (HTTP $MEMBER_HTTP_CODE), will attempt to add"
           fi
 
       - name: Add User to Group
