@@ -1,0 +1,378 @@
+name: Elevate User to CS-DEV-Admins
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_email:
+        description: 'Email address of user to elevate'
+        required: true
+        type: string
+
+jobs:
+  request-elevation:
+    runs-on: ubuntu-latest
+    outputs:
+      user_id: ${{ steps.user_check.outputs.user_id }}
+      user_display_name: ${{ steps.user_check.outputs.user_display_name }}
+      user_email: ${{ steps.validate.outputs.normalized_email }}
+
+    steps:
+      - name: Authenticate to Microsoft Graph
+        id: auth
+        run: |
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Error: Failed to authenticate"
+            echo "$TOKEN_RESPONSE" | jq '.'
+            exit 1
+          fi
+
+          echo "Successfully authenticated to Microsoft Graph API"
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Validate Input Email
+        id: validate
+        run: |
+          EMAIL="${{ inputs.user_email }}"
+
+          if ! echo "$EMAIL" | grep -qE '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+            echo "Error: Invalid email format: $EMAIL"
+            exit 1
+          fi
+
+          NORMALIZED_EMAIL=$(echo "$EMAIL" | tr '[:upper:]' '[:lower:]' | xargs)
+          echo "normalized_email=$NORMALIZED_EMAIL" >> $GITHUB_OUTPUT
+          echo "Email validated: $NORMALIZED_EMAIL"
+
+      - name: Check if User Exists
+        id: user_check
+        run: |
+          EMAIL="${{ steps.validate.outputs.normalized_email }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
+
+          USER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://graph.microsoft.com/v1.0/users/$EMAIL")
+
+          HTTP_CODE=$(echo "$USER_RESPONSE" | tail -n1)
+          USER_JSON=$(echo "$USER_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            USER_ID=$(echo "$USER_JSON" | jq -r '.id')
+            USER_DISPLAY_NAME=$(echo "$USER_JSON" | jq -r '.displayName')
+            echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+            echo "user_display_name=$USER_DISPLAY_NAME" >> $GITHUB_OUTPUT
+            echo "User found: $USER_DISPLAY_NAME (ID: $USER_ID)"
+          else
+            echo "Error: User not found: $EMAIL"
+            exit 1
+          fi
+
+      - name: Send Slack Approval Request
+        continue-on-error: true
+        run: |
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "User Elevation Approval Required",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "User Elevation Approval Required"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Requested By:*\n${{ github.actor }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*User to Elevate:*\n${{ steps.validate.outputs.normalized_email }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Display Name:*\n${{ steps.user_check.outputs.user_display_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Target Group:*\nCS-DEV-Admins"
+                  }
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Action Required:*\nThis request requires approval before the user can be elevated to CS-DEV-Admins group."
+                }
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "Review in GitHub"
+                    },
+                    "url": "${WORKFLOW_URL}",
+                    "style": "primary"
+                  }
+                ]
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "Requested at ${TIMESTAMP}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          for i in 1 2; do
+            RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/slack_response.txt \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "$PAYLOAD" \
+              "${{ secrets.SLACK_NOTIFY_WEBHOOK_URL }}")
+
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Slack notification sent successfully"
+              break
+            else
+              echo "Slack notification attempt $i failed with status $RESPONSE"
+              if [ $i -eq 1 ]; then
+                sleep 5
+              fi
+            fi
+          done
+
+  elevate-user:
+    runs-on: ubuntu-latest
+    needs: request-elevation
+    environment:
+      name: user-elevation-approval
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Authenticate to Microsoft Graph
+        id: auth
+        run: |
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Error: Failed to authenticate"
+            exit 1
+          fi
+
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Resolve CS-DEV-Admins Group
+        id: resolve_group
+        run: |
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
+          GROUP_NAME="CS-DEV-Admins"
+
+          GROUP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://graph.microsoft.com/v1.0/groups?\$filter=displayName%20eq%20'$GROUP_NAME'")
+
+          HTTP_CODE=$(echo "$GROUP_RESPONSE" | tail -n1)
+          GROUP_JSON=$(echo "$GROUP_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            GROUP_COUNT=$(echo "$GROUP_JSON" | jq -r '.value | length')
+
+            if [ "$GROUP_COUNT" = "0" ]; then
+              echo "Error: Group not found: $GROUP_NAME"
+              exit 1
+            else
+              GROUP_ID=$(echo "$GROUP_JSON" | jq -r '.value[0].id')
+              echo "group_id=$GROUP_ID" >> $GITHUB_OUTPUT
+              echo "Found group: $GROUP_NAME (ID: $GROUP_ID)"
+            fi
+          else
+            echo "Error: Failed to search for group"
+            exit 1
+          fi
+
+      - name: Check Current Group Membership
+        id: check_membership
+        run: |
+          GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
+          USER_ID="${{ needs.request-elevation.outputs.user_id }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
+
+          echo "Checking if user is already in CS-DEV-Admins..."
+          MEMBER_CHECK=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members/$USER_ID/\$ref")
+
+          MEMBER_HTTP_CODE=$(echo "$MEMBER_CHECK" | tail -n1)
+
+          if [ "$MEMBER_HTTP_CODE" = "200" ]; then
+            echo "is_member=true" >> $GITHUB_OUTPUT
+            echo "User is already a member of CS-DEV-Admins"
+          else
+            echo "is_member=false" >> $GITHUB_OUTPUT
+            echo "User is not a member of CS-DEV-Admins"
+          fi
+
+      - name: Add User to CS-DEV-Admins
+        if: steps.check_membership.outputs.is_member != 'true'
+        run: |
+          GROUP_ID="${{ steps.resolve_group.outputs.group_id }}"
+          USER_ID="${{ needs.request-elevation.outputs.user_id }}"
+          ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/$USER_ID"
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members/\$ref")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "User elevated successfully to CS-DEV-Admins"
+          else
+            echo "Error elevating user (HTTP $HTTP_CODE):"
+            echo "$BODY"
+            exit 1
+          fi
+
+      - name: Send Slack Completion Notification
+        if: always()
+        continue-on-error: true
+        run: |
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          if [ "${{ steps.check_membership.outputs.is_member }}" = "true" ]; then
+            STATUS="Already Member"
+            EMOJI="information_source"
+          elif [ "${{ job.status }}" = "success" ]; then
+            STATUS="Elevated Successfully"
+            EMOJI="white_check_mark"
+          else
+            STATUS="Failed"
+            EMOJI="x"
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "User Elevation Completed",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "User Elevation Completed"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Requested By:*\n${{ github.actor }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*User Elevated:*\n${{ needs.request-elevation.outputs.user_email }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Display Name:*\n${{ needs.request-elevation.outputs.user_display_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Status:*\n${STATUS}"
+                  }
+                ]
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "<${WORKFLOW_URL}|View Workflow Run> | Completed at ${TIMESTAMP}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          curl -s -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            "${{ secrets.SLACK_NOTIFY_WEBHOOK_URL }}"
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# User Elevation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## User Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Email**: ${{ needs.request-elevation.outputs.user_email }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Display Name**: ${{ needs.request-elevation.outputs.user_display_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **User Object ID**: ${{ needs.request-elevation.outputs.user_id }}" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Elevation Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Group**: CS-DEV-Admins" >> $GITHUB_STEP_SUMMARY
+          echo "- **Group Object ID**: ${{ steps.resolve_group.outputs.group_id }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_membership.outputs.is_member }}" = "true" ]; then
+            echo "- **Result**: User was already a member" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Result**: User elevated successfully" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Workflow Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Requested By**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Approved By**: Check environment approvers" >> $GITHUB_STEP_SUMMARY
+          echo "- **Completed**: $(date -u +"%Y-%m-%d %H:%M UTC")" >> $GITHUB_STEP_SUMMARY
