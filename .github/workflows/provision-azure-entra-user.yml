@@ -1,5 +1,7 @@
 name: Provision Azure Entra User
 
+run-name: Provision ${{ inputs.user_email }} to Azure Entra
+
 on:
   workflow_dispatch:
     inputs:

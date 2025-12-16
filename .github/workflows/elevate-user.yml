@@ -1,4 +1,6 @@
-name: Elevate $EMAIL to CS-DEV-Admins
+name: Elevate User to CS-DEV-Admins
+
+run-name: Elevate ${{ inputs.user_email }} to CS-DEV-Admins
 
 on:
   workflow_dispatch:
