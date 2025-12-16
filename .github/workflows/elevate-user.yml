@@ -1,4 +1,4 @@
-name: Elevate User to CS-DEV-Admins
+name: Elevate $EMAIL to CS-DEV-Admins
 
 on:
   workflow_dispatch:
@@ -193,6 +193,7 @@ jobs:
     environment:
       name: user-elevation-approval
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      
 
     steps:
       - name: Authenticate to Microsoft Graph
