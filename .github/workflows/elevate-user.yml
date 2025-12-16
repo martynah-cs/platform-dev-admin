@@ -59,22 +59,40 @@ jobs:
           EMAIL="${{ steps.validate.outputs.normalized_email }}"
           ACCESS_TOKEN="${{ steps.auth.outputs.access_token }}"
 
+          # Search for user by mail or userPrincipalName
+          echo "Searching for user: $EMAIL"
           USER_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
             -H "Content-Type: application/json" \
-            "https://graph.microsoft.com/v1.0/users/$EMAIL")
+            "https://graph.microsoft.com/v1.0/users?\$filter=mail%20eq%20'$EMAIL'%20or%20userPrincipalName%20eq%20'$EMAIL'")
 
           HTTP_CODE=$(echo "$USER_RESPONSE" | tail -n1)
           USER_JSON=$(echo "$USER_RESPONSE" | head -n-1)
 
           if [ "$HTTP_CODE" = "200" ]; then
-            USER_ID=$(echo "$USER_JSON" | jq -r '.id')
-            USER_DISPLAY_NAME=$(echo "$USER_JSON" | jq -r '.displayName')
+            USER_COUNT=$(echo "$USER_JSON" | jq -r '.value | length')
+
+            if [ "$USER_COUNT" = "0" ]; then
+              echo "Error: User not found with email: $EMAIL"
+              echo "The user may not exist in the directory, or the email format may be different"
+              exit 1
+            elif [ "$USER_COUNT" -gt 1 ]; then
+              echo "Warning: Multiple users found with email: $EMAIL"
+              echo "Using the first match"
+            fi
+
+            USER_ID=$(echo "$USER_JSON" | jq -r '.value[0].id')
+            USER_DISPLAY_NAME=$(echo "$USER_JSON" | jq -r '.value[0].displayName')
+            USER_UPN=$(echo "$USER_JSON" | jq -r '.value[0].userPrincipalName')
+
             echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
             echo "user_display_name=$USER_DISPLAY_NAME" >> $GITHUB_OUTPUT
-            echo "User found: $USER_DISPLAY_NAME (ID: $USER_ID)"
+            echo "User found: $USER_DISPLAY_NAME"
+            echo "UPN: $USER_UPN"
+            echo "ID: $USER_ID"
           else
-            echo "Error: User not found: $EMAIL"
+            echo "Error: Failed to search for user (HTTP $HTTP_CODE)"
+            echo "$USER_JSON"
             exit 1
           fi
 
