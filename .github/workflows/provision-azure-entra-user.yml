@@ -466,73 +466,73 @@ jobs:
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "Provisioning completed successfully" >> $GITHUB_STEP_SUMMARY
 
-        - name: Send Slack Notification
-                continue-on-error: true
-                run: |
-                  WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                  TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+      - name: Send Slack Notification
+        continue-on-error: true
+        run: |
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
 
-                  PAYLOAD=$(cat <<EOF
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "Azure Entra User Provisioning COMPLETED",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "Azure Entra User Provisioning Completed"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
                   {
-                    "text": "Azure Entra User Provisioning COMPLETED",
-                    "blocks": [
-                      {
-                        "type": "header",
-                        "text": {
-                          "type": "plain_text",
-                          "text": "Azure Entra User Provisioning Completed"
-                        }
-                      },
-                      {
-                        "type": "section",
-                        "fields": [
-                          {
-                            "type": "mrkdwn",
-                            "text": "*Initiated By:*\n${{ github.actor }}"
-                          },
-                          {
-                            "type": "mrkdwn",
-                            "text": "*User Email:*\n${{ inputs.user_email }}"
-                          },
-                          {
-                            "type": "mrkdwn",
-                            "text": "*Target Group:*\n${{ inputs.entra_group_name }}"
-                          },
-                          {
-                            "type": "mrkdwn",
-                            "text": "*Status:*\nIn Progress"
-                          }
-                        ]
-                      },
-                      {
-                        "type": "context",
-                        "elements": [
-                          {
-                            "type": "mrkdwn",
-                            "text": "<${WORKFLOW_URL}|View Workflow Run> | Triggered at ${TIMESTAMP}"
-                          }
-                        ]
-                      }
-                    ]
+                    "type": "mrkdwn",
+                    "text": "*Initiated By:*\n${{ github.actor }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*User Email:*\n${{ inputs.user_email }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Target Group:*\n${{ inputs.entra_group_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Status:*\nCompleted"
                   }
-                  EOF
-                  )
+                ]
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "<${WORKFLOW_URL}|View Workflow Run> | Completed at ${TIMESTAMP}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
 
-                  # Retry logic for Slack notification
-                  for i in 1 2; do
-                    RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/slack_response.txt \
-                      -X POST \
-                      -H 'Content-Type: application/json' \
-                      -d "$PAYLOAD" \
-                      "${{ secrets.SLACK_NOTIFY_WEBHOOK_URL }}")
+          # Retry logic for Slack notification
+          for i in 1 2; do
+            RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/slack_response.txt \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "$PAYLOAD" \
+              "${{ secrets.SLACK_NOTIFY_WEBHOOK_URL }}")
 
-                    if [ "$RESPONSE" = "200" ]; then
-                      echo "Slack notification sent successfully"
-                      break
-                    else
-                      echo "Slack notification attempt $i failed with status $RESPONSE"
-                      if [ $i -eq 1 ]; then
-                        sleep 5
-                      fi
-                    fi
-                  done
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Slack notification sent successfully"
+              break
+            else
+              echo "Slack notification attempt $i failed with status $RESPONSE"
+              if [ $i -eq 1 ]; then
+                sleep 5
+              fi
+            fi
+          done
